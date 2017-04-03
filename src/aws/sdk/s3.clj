@@ -15,10 +15,13 @@
   (:import com.amazonaws.auth.AWSCredentials
            com.amazonaws.auth.BasicAWSCredentials
            com.amazonaws.auth.BasicSessionCredentials
-           com.amazonaws.services.s3.AmazonS3Client
            com.amazonaws.AmazonServiceException
            com.amazonaws.ClientConfiguration
            com.amazonaws.HttpMethod
+           com.amazonaws.auth.AWSStaticCredentialsProvider
+           com.amazonaws.client.builder.AwsClientBuilder$EndpointConfiguration
+           com.amazonaws.services.s3.AmazonS3ClientBuilder
+           com.amazonaws.services.s3.AmazonS3
            com.amazonaws.services.s3.model.AccessControlList
            com.amazonaws.services.s3.model.Bucket
            com.amazonaws.services.s3.model.Grant
@@ -50,7 +53,7 @@
            java.io.InputStream
            java.nio.charset.Charset))
 
-(defn- s3-client*
+(defn- ^AmazonS3 s3
   [cred]
   (let [client-configuration (ClientConfiguration.)]
     (when-let [conn-timeout (:conn-timeout cred)]
@@ -73,19 +76,20 @@
       (.setProxyDomain client-configuration proxy-domain))
     (when-let [proxy-workstation (get-in cred [:proxy :workstation])]
       (.setProxyWorkstation client-configuration proxy-workstation))
-    (let [aws-creds
-          (if (:token cred)
-            (BasicSessionCredentials. (:access-key cred) (:secret-key cred) (:token cred))
-            (BasicAWSCredentials. (:access-key cred) (:secret-key cred)))
+    (let [aws-creds (if (:token cred)
+                      (BasicSessionCredentials. (:access-key cred) (:secret-key cred) (:token cred))
+                      (BasicAWSCredentials. (:access-key cred) (:secret-key cred)))
+          client-builder (doto (AmazonS3ClientBuilder/standard)
+                           (.setClientConfiguration client-configuration)
+                           (.setCredentials (AWSStaticCredentialsProvider. aws-creds)))]
 
-          client (AmazonS3Client. ^AWSCredentials aws-creds ^ClientConfiguration client-configuration)]
-      (when-let [endpoint (:endpoint cred)]
-        (.setEndpoint client endpoint))
-      client)))
-
-(def ^{:private true :tag AmazonS3Client}
-  s3-client
-  (memoize s3-client*))
+      (let [endpoint (:endpoint cred)
+            region (:region cred)]
+        (if (and endpoint region)
+          (let [epc (AwsClientBuilder$EndpointConfiguration. endpoint region)
+                _ (.setEndpointConfiguration client-builder epc)] ; void return type :-(
+            (.build client-builder))                              ; has the updated endpoint configuration
+          (.build client-builder))))))
 
 (defprotocol ^{:no-doc true} Mappable
   "Convert a value into a Clojure map."
@@ -107,17 +111,17 @@
 (defn bucket-exists?
   "Returns true if the supplied bucket name already exists in S3."
   [cred name]
-  (.doesBucketExist (s3-client cred) name))
+  (.doesBucketExist (s3 cred) name))
 
 (defn create-bucket
   "Create a new S3 bucket with the supplied name."
   [cred ^String name]
-  (to-map (.createBucket (s3-client cred) name)))
+  (to-map (.createBucket (s3 cred) name)))
 
 (defn delete-bucket
   "Delete the S3 bucket with the supplied name."
   [cred ^String name]
-  (.deleteBucket (s3-client cred) name))
+  (.deleteBucket (s3 cred) name))
 
 (defn list-buckets
   "List all the S3 buckets for the supplied credentials. The buckets will be
@@ -126,7 +130,7 @@
     :creation-date - the date when the bucket was created
     :owner         - the owner of the bucket"
   [cred]
-  (map to-map (.listBuckets (s3-client cred))))
+  (map to-map (.listBuckets (s3 cred))))
 
 (defprotocol ^{:no-doc true} ToPutRequest
   "A protocol for constructing a map that represents an S3 put request."
@@ -140,9 +144,9 @@
   String
   (put-request [s]
     (let [bytes (.getBytes s)]
-      {:input-stream     (ByteArrayInputStream. bytes)
-       :content-length   (count bytes)
-       :content-type     (str "text/plain; charset=" (.name (Charset/defaultCharset)))})))
+      {:input-stream   (ByteArrayInputStream. bytes)
+       :content-length (count bytes)
+       :content-type   (str "text/plain; charset=" (.name (Charset/defaultCharset)))})))
 
 (defmacro set-attr
   "Set an attribute on an object if not nil."
@@ -158,12 +162,12 @@
   "Convert a map of object metadata into a ObjectMetadata instance."
   [metadata]
   (doto (ObjectMetadata.)
-    (set-attr .setCacheControl         (:cache-control metadata))
-    (set-attr .setContentDisposition   (:content-disposition metadata))
-    (set-attr .setContentEncoding      (:content-encoding metadata))
-    (set-attr .setContentLength        (:content-length metadata))
-    (set-attr .setContentMD5           (:content-md5 metadata))
-    (set-attr .setContentType          (:content-type metadata))
+    (set-attr .setCacheControl (:cache-control metadata))
+    (set-attr .setContentDisposition (:content-disposition metadata))
+    (set-attr .setContentEncoding (:content-encoding metadata))
+    (set-attr .setContentLength (:content-length metadata))
+    (set-attr .setContentMD5 (:content-md5 metadata))
+    (set-attr .setContentType (:content-type metadata))
     (set-attr .setServerSideEncryption (:server-side-encryption metadata))
     (set-attr .setUserMetadata
               (walk/stringify-keys (dissoc metadata
@@ -180,17 +184,17 @@
   map."
   [^String bucket ^String key request]
   (cond
-   (:file request)
-     (let [put-obj-req (PutObjectRequest. bucket key ^java.io.File (:file request))]
-       (.setMetadata put-obj-req (map->ObjectMetadata (dissoc request :file)))
-       put-obj-req)
-   (:input-stream request)
-     (PutObjectRequest.
+    (:file request)
+    (let [put-obj-req (PutObjectRequest. bucket key ^java.io.File (:file request))]
+      (.setMetadata put-obj-req (map->ObjectMetadata (dissoc request :file)))
+      put-obj-req)
+    (:input-stream request)
+    (PutObjectRequest.
       bucket key
       (:input-stream request)
       (map->ObjectMetadata (dissoc request :input-stream)))))
 
-(declare create-acl) ; used by put-object
+(declare create-acl)                                        ; used by put-object
 
 (defn put-object
   "Put a value into an S3 bucket at the specified key. The value can be
@@ -215,40 +219,40 @@
                  (->PutObjectRequest bucket key))]
     (when permissions
       (.setAccessControlList req (create-acl permissions)))
-    (.putObject (s3-client cred) req)))
+    (.putObject (s3 cred) req)))
 
 (defn- initiate-multipart-upload
   [cred bucket key]
   (.getUploadId (.initiateMultipartUpload
-                  (s3-client cred)
+                  (s3 cred)
                   (InitiateMultipartUploadRequest. bucket key))))
 
 (defn- abort-multipart-upload
   [{cred :cred bucket :bucket key :key upload-id :upload-id}]
   (.abortMultipartUpload
-    (s3-client cred)
+    (s3 cred)
     (AbortMultipartUploadRequest. bucket key upload-id)))
 
 (defn- complete-multipart-upload
   [{cred :cred bucket :bucket key :key upload-id :upload-id e-tags :e-tags}]
   (.completeMultipartUpload
-    (s3-client cred)
+    (s3 cred)
     (CompleteMultipartUploadRequest. bucket key upload-id e-tags)))
 
 (defn- upload-part
-  [{cred :cred bucket :bucket key :key upload-id :upload-id
+  [{cred      :cred bucket :bucket key :key upload-id :upload-id
     part-size :part-size offset :offset ^java.io.File file :file}]
   (.getPartETag
-   (.uploadPart
-    (s3-client cred)
-    (doto (UploadPartRequest.)
-      (.setBucketName bucket)
-      (.setKey key)
-      (.setUploadId upload-id)
-      (.setPartNumber (+ 1 (/ offset part-size)))
-      (.setFileOffset offset)
-      (.setPartSize ^long (min part-size (- (.length file) offset)))
-      (.setFile file)))))
+    (.uploadPart
+      (s3 cred)
+      (doto (UploadPartRequest.)
+        (.setBucketName bucket)
+        (.setKey key)
+        (.setUploadId upload-id)
+        (.setPartNumber (+ 1 (/ offset part-size)))
+        (.setFileOffset offset)
+        (.setPartSize ^long (min part-size (- (.length file) offset)))
+        (.setFile file)))))
 
 (defn put-multipart-object
   "Do a multipart upload of a file into a S3 bucket at the specified key.
@@ -262,16 +266,16 @@
     :threads   - the number of threads that will upload parts concurrently.
                  Defaults to 16."
   [cred bucket key ^java.io.File file & [{:keys [part-size threads]
-                            :or {part-size (* 5 1024 1024) threads 16}}]]
+                                          :or   {part-size (* 5 1024 1024) threads 16}}]]
   (let [upload-id (initiate-multipart-upload cred bucket key)
-        upload    {:upload-id upload-id :cred cred :bucket bucket :key key :file file}
-        pool      (Executors/newFixedThreadPool threads)
-        offsets   (range 0 (.length file) part-size)
-        tasks     (map #(fn [] (upload-part (assoc upload :offset % :part-size part-size)))
-                       offsets)]
+        upload {:upload-id upload-id :cred cred :bucket bucket :key key :file file}
+        pool (Executors/newFixedThreadPool threads)
+        offsets (range 0 (.length file) part-size)
+        tasks (map #(fn [] (upload-part (assoc upload :offset % :part-size part-size)))
+                   offsets)]
     (try
       (complete-multipart-upload
-        (assoc upload :e-tags (map #(.get ^java.util.concurrent.Future %)  (.invokeAll pool tasks))))
+        (assoc upload :e-tags (map #(.get ^java.util.concurrent.Future %) (.invokeAll pool tasks))))
       (catch Exception ex
         (abort-multipart-upload upload)
         (.shutdown pool)
@@ -296,7 +300,7 @@
      :etag                   (.getETag metadata)
      :last-modified          (.getLastModified metadata)
      :server-side-encryption (.getServerSideEncryption metadata)
-     :user (walk/keywordize-keys (into {} (.getUserMetadata metadata)))
+     :user                   (walk/keywordize-keys (into {} (.getUserMetadata metadata)))
      :version-id             (.getVersionId metadata)})
   ObjectListing
   (to-map [listing]
@@ -317,9 +321,9 @@
      :key      (.getKey summary)})
   S3VersionSummary
   (to-map [summary]
-    {:metadata {:content-length (.getSize summary)
-                :etag           (.getETag summary)
-                :last-modified  (.getLastModified summary)}
+    {:metadata       {:content-length (.getSize summary)
+                      :etag           (.getETag summary)
+                      :last-modified  (.getLastModified summary)}
      :version-id     (.getVersionId summary)
      :latest?        (.isLatest summary)
      :delete-marker? (.isDeleteMarker summary)
@@ -363,9 +367,9 @@
   If these rules are not followed, the client can run out of resources by
   allocating too many open, but unused, HTTP connections."
   ([cred ^String bucket ^String key]
-     (to-map (.getObject (s3-client cred) bucket key)))
+   (to-map (.getObject (s3 cred) bucket key)))
   ([cred ^String bucket ^String key ^String version-id]
-     (to-map (.getObject (s3-client cred) (GetObjectRequest. bucket key version-id)))))
+   (to-map (.getObject (s3 cred) (GetObjectRequest. bucket key version-id)))))
 
 (defn- map->GetObjectMetadataRequest
   "Create a ListObjectsRequest instance from a map of values."
@@ -389,9 +393,9 @@
      :server-side-encryption - the server-side encryption algorithm"
   [cred bucket key & [options]]
   (to-map
-   (.getObjectMetadata
-    (s3-client cred)
-    (map->GetObjectMetadataRequest (merge {:bucket bucket :key key} options)))))
+    (.getObjectMetadata
+      (s3 cred)
+      (map->GetObjectMetadataRequest (merge {:bucket bucket :key key} options)))))
 
 (defn- map->ListObjectsRequest
   "Create a ListObjectsRequest instance from a map of values."
@@ -399,10 +403,10 @@
   [request]
   (doto (ListObjectsRequest.)
     (set-attr .setBucketName (:bucket request))
-    (set-attr .setDelimiter  (:delimiter request))
-    (set-attr .setMarker     (:marker request))
-    (set-attr .setMaxKeys    (maybe-int (:max-keys request)))
-    (set-attr .setPrefix     (:prefix request))))
+    (set-attr .setDelimiter (:delimiter request))
+    (set-attr .setMarker (:marker request))
+    (set-attr .setMaxKeys (maybe-int (:max-keys request)))
+    (set-attr .setPrefix (:prefix request))))
 
 (defn- http-method [method]
   (-> method name str/upper-case HttpMethod/valueOf))
@@ -413,12 +417,12 @@
     :http-method - the HTTP method for the URL (defaults to :get)"
   [cred bucket key & [options]]
   (.toString
-   (.generatePresignedUrl
-    (s3-client cred)
-    bucket
-    key
-    (coerce/to-date (:expires options (-> 1 t/days t/from-now)))
-    (http-method (:http-method options :get)))))
+    (.generatePresignedUrl
+      (s3 cred)
+      bucket
+      key
+      (coerce/to-date (:expires options (-> 1 t/days t/from-now)))
+      (http-method (:http-method options :get)))))
 
 (defn list-objects
   "List the objects in an S3 bucket. A optional map of options may be supplied.
@@ -439,14 +443,14 @@
     :next-marker     - the next marker of the listing"
   [cred bucket & [options]]
   (to-map
-   (.listObjects
-    (s3-client cred)
-    (map->ListObjectsRequest (merge {:bucket bucket} options)))))
+    (.listObjects
+      (s3 cred)
+      (map->ListObjectsRequest (merge {:bucket bucket} options)))))
 
 (defn delete-object
   "Delete an object from an S3 bucket."
   [cred bucket key]
-  (.deleteObject (s3-client cred) bucket key))
+  (.deleteObject (s3 cred) bucket key))
 
 (defn object-exists?
   "Returns true if an object exists in the supplied bucket and key."
@@ -463,56 +467,56 @@
   "Copy an existing S3 object to another key. Returns a map containing
    the data returned from S3"
   ([cred bucket src-key dest-key]
-     (copy-object cred bucket src-key bucket dest-key))
+   (copy-object cred bucket src-key bucket dest-key))
   ([cred src-bucket src-key dest-bucket dest-key]
-     (to-map (.copyObject (s3-client cred) src-bucket src-key dest-bucket dest-key))))
+   (to-map (.copyObject (s3 cred) src-bucket src-key dest-bucket dest-key))))
 
 (defn- map->ListVersionsRequest
   "Create a ListVersionsRequest instance from a map of values."
   [request]
   (doto (ListVersionsRequest.)
-    (set-attr .setBucketName      (:bucket request))
-    (set-attr .setDelimiter       (:delimiter request))
-    (set-attr .setKeyMarker       (:key-marker request))
-    (set-attr .setMaxResults      (maybe-int (:max-results request)))
-    (set-attr .setPrefix          (:prefix request))
+    (set-attr .setBucketName (:bucket request))
+    (set-attr .setDelimiter (:delimiter request))
+    (set-attr .setKeyMarker (:key-marker request))
+    (set-attr .setMaxResults (maybe-int (:max-results request)))
+    (set-attr .setPrefix (:prefix request))
     (set-attr .setVersionIdMarker (:version-id-marker request))))
 
 (defn list-versions
- "List the versions in an S3 bucket. A optional map of options may be supplied.
-  Available options are:
-    :delimiter         - the delimiter used in prefix (such as a '/')
-    :key-marker        - read versions from the sorted list of all versions starting
-                         at this marker.
-    :max-results       - read only this many versions
-    :prefix            - read only versions with keys having this prefix
-    :version-id-marker - read objects after this version id
+  "List the versions in an S3 bucket. A optional map of options may be supplied.
+   Available options are:
+     :delimiter         - the delimiter used in prefix (such as a '/')
+     :key-marker        - read versions from the sorted list of all versions starting
+                          at this marker.
+     :max-results       - read only this many versions
+     :prefix            - read only versions with keys having this prefix
+     :version-id-marker - read objects after this version id
 
-  The version listing will be returned as a map containing the following versions:
-    :bucket                 - the name of the bucket
-    :prefix                 - the supplied prefix (or nil if none supplied)
-    :versions               - a sorted list of versions, newest first, each
-                              version has:
-                              :version-id     - the unique version id
-                              :latest?        - is this the latest version for that key?
-                              :delete-marker? - is this a delete-marker?
-    :common-prefixes        - the common prefixes of keys omitted by the delimiter
-    :max-results            - the maximum number of results to be returned
-    :truncated?             - true if the results were truncated
-    :key-marker             - the key marker of the listing
-    :next-version-id-marker - the version ID marker to use in the next listVersions
-                              request in order to obtain the next page of results.
-    :version-id-marker      - the version id marker of the listing"
- [cred bucket & [options]]
- (to-map
-   (.listVersions
-    (s3-client cred)
-    (map->ListVersionsRequest (merge {:bucket bucket} options)))))
+   The version listing will be returned as a map containing the following versions:
+     :bucket                 - the name of the bucket
+     :prefix                 - the supplied prefix (or nil if none supplied)
+     :versions               - a sorted list of versions, newest first, each
+                               version has:
+                               :version-id     - the unique version id
+                               :latest?        - is this the latest version for that key?
+                               :delete-marker? - is this a delete-marker?
+     :common-prefixes        - the common prefixes of keys omitted by the delimiter
+     :max-results            - the maximum number of results to be returned
+     :truncated?             - true if the results were truncated
+     :key-marker             - the key marker of the listing
+     :next-version-id-marker - the version ID marker to use in the next listVersions
+                               request in order to obtain the next page of results.
+     :version-id-marker      - the version id marker of the listing"
+  [cred bucket & [options]]
+  (to-map
+    (.listVersions
+      (s3 cred)
+      (map->ListVersionsRequest (merge {:bucket bucket} options)))))
 
 (defn delete-version
   "Deletes a specific version of the specified object in the specified bucket."
   [cred bucket key version-id]
-  (.deleteVersion (s3-client cred) bucket key version-id))
+  (.deleteVersion (s3 cred) bucket key version-id))
 
 (defprotocol ^{:no-doc true} ToClojure
   "Convert an object into an idiomatic Clojure value."
@@ -529,17 +533,17 @@
   GroupGrantee
   (to-clojure [grantee]
     (condp = grantee
-      GroupGrantee/AllUsers           :all-users
+      GroupGrantee/AllUsers :all-users
       GroupGrantee/AuthenticatedUsers :authenticated-users
-      GroupGrantee/LogDelivery        :log-delivery))
+      GroupGrantee/LogDelivery :log-delivery))
   Permission
   (to-clojure [permission]
     (condp = permission
       Permission/FullControl :full-control
-      Permission/Read        :read
-      Permission/ReadAcp     :read-acp
-      Permission/Write       :write
-      Permission/WriteAcp    :write-acp)))
+      Permission/Read :read
+      Permission/ReadAcp :read-acp
+      Permission/Write :write
+      Permission/WriteAcp :write-acp)))
 
 (extend-protocol Mappable
   Grant
@@ -562,33 +566,33 @@
     :permission - the type of permission (:read, :write, :read-acp, :write-acp or
                   :full-control)."
   [cred ^String bucket]
-  (to-map (.getBucketAcl (s3-client cred) bucket)))
+  (to-map (.getBucketAcl (s3 cred) bucket)))
 
 (defn get-object-acl
   "Get the access control list (ACL) for the supplied object. See get-bucket-acl
   for a detailed description of the return value."
   [cred bucket key]
-  (to-map (.getObjectAcl (s3-client cred) bucket key)))
+  (to-map (.getObjectAcl (s3 cred) bucket key)))
 
 (defn- permission [perm]
   (case perm
     :full-control Permission/FullControl
-    :read         Permission/Read
-    :read-acp     Permission/ReadAcp
-    :write        Permission/Write
-    :write-acp    Permission/WriteAcp))
+    :read Permission/Read
+    :read-acp Permission/ReadAcp
+    :write Permission/Write
+    :write-acp Permission/WriteAcp))
 
 (defn- grantee [grantee]
   (cond
-   (keyword? grantee)
-     (case grantee
-      :all-users           GroupGrantee/AllUsers
+    (keyword? grantee)
+    (case grantee
+      :all-users GroupGrantee/AllUsers
       :authenticated-users GroupGrantee/AuthenticatedUsers
-      :log-delivery        GroupGrantee/LogDelivery)
-   (:id grantee)
-     (CanonicalGrantee. (:id grantee))
-   (:email grantee)
-     (EmailAddressGrantee. (:email grantee))))
+      :log-delivery GroupGrantee/LogDelivery)
+    (:id grantee)
+    (CanonicalGrantee. (:id grantee))
+    (:email grantee)
+    (EmailAddressGrantee. (:email grantee))))
 
 (defn- clear-acl [^AccessControlList acl]
   (doseq [grantee (->> (.getGrants acl)
@@ -599,8 +603,8 @@
 (defn- add-acl-grants [^AccessControlList acl grants]
   (doseq [g grants]
     (.grantPermission acl
-      (grantee (:grantee g))
-      (permission (:permission g)))))
+                      (grantee (:grantee g))
+                      (permission (:permission g)))))
 
 (defn- update-acl [^AccessControlList acl funcs]
   (let [grants (:grants (to-map acl))
@@ -623,17 +627,17 @@
       (grant {:email \"foo@example.com\"} :full-control)
       (revoke {:email \"bar@example.com\"} :write))"
   [cred ^String bucket & funcs]
-  (let [acl (.getBucketAcl (s3-client cred) bucket)]
+  (let [acl (.getBucketAcl (s3 cred) bucket)]
     (update-acl acl funcs)
-    (.setBucketAcl (s3-client cred) bucket acl)))
+    (.setBucketAcl (s3 cred) bucket acl)))
 
 (defn update-object-acl
   "Updates the access control list (ACL) for the supplied object using functions
   that update a set of grants (see update-bucket-acl for more details)."
   [cred ^String bucket ^String key & funcs]
-  (let [acl (.getObjectAcl (s3-client cred) bucket key)]
+  (let [acl (.getObjectAcl (s3 cred) bucket key)]
     (update-acl acl funcs)
-    (.setObjectAcl (s3-client cred) bucket key acl)))
+    (.setObjectAcl (s3 cred) bucket key acl)))
 
 (defn grant
   "Returns a function that adds a new grant map to a set of grants.
