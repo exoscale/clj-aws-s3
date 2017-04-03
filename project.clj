@@ -3,7 +3,8 @@
   :url "https://github.com/weavejester/clj-aws-s3"
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
-  :dependencies [[org.clojure/clojure "1.2.1"]
-                 [com.amazonaws/aws-java-sdk "1.7.5"]
-                 [clj-time "0.6.0"]]
+  :dependencies [[org.clojure/clojure "1.8.0"]
+                 [com.amazonaws/aws-java-sdk "1.11.106"]
+                 [org.apache.httpcomponents/httpclient "4.5.2" ]
+                 [clj-time "0.13.0"]]
   :plugins [[codox "0.8.10"]])

@@ -12,7 +12,8 @@
             [clj-time.core :as t]
             [clj-time.coerce :as coerce]
             [clojure.walk :as walk])
-  (:import com.amazonaws.auth.BasicAWSCredentials
+  (:import com.amazonaws.auth.AWSCredentials
+           com.amazonaws.auth.BasicAWSCredentials
            com.amazonaws.auth.BasicSessionCredentials
            com.amazonaws.services.s3.AmazonS3Client
            com.amazonaws.AmazonServiceException
@@ -77,7 +78,7 @@
             (BasicSessionCredentials. (:access-key cred) (:secret-key cred) (:token cred))
             (BasicAWSCredentials. (:access-key cred) (:secret-key cred)))
 
-          client (AmazonS3Client. aws-creds client-configuration)]
+          client (AmazonS3Client. ^AWSCredentials aws-creds ^ClientConfiguration client-configuration)]
       (when-let [endpoint (:endpoint cred)]
         (.setEndpoint client endpoint))
       client)))
@@ -217,26 +218,26 @@
     (.putObject (s3-client cred) req)))
 
 (defn- initiate-multipart-upload
-  [cred bucket key] 
-  (.getUploadId (.initiateMultipartUpload 
-                  (s3-client cred) 
+  [cred bucket key]
+  (.getUploadId (.initiateMultipartUpload
+                  (s3-client cred)
                   (InitiateMultipartUploadRequest. bucket key))))
 
 (defn- abort-multipart-upload
-  [{cred :cred bucket :bucket key :key upload-id :upload-id}] 
-  (.abortMultipartUpload 
-    (s3-client cred) 
+  [{cred :cred bucket :bucket key :key upload-id :upload-id}]
+  (.abortMultipartUpload
+    (s3-client cred)
     (AbortMultipartUploadRequest. bucket key upload-id)))
 
 (defn- complete-multipart-upload
-  [{cred :cred bucket :bucket key :key upload-id :upload-id e-tags :e-tags}] 
+  [{cred :cred bucket :bucket key :key upload-id :upload-id e-tags :e-tags}]
   (.completeMultipartUpload
     (s3-client cred)
     (CompleteMultipartUploadRequest. bucket key upload-id e-tags)))
 
 (defn- upload-part
   [{cred :cred bucket :bucket key :key upload-id :upload-id
-    part-size :part-size offset :offset ^java.io.File file :file}] 
+    part-size :part-size offset :offset ^java.io.File file :file}]
   (.getPartETag
    (.uploadPart
     (s3-client cred)
@@ -271,8 +272,8 @@
     (try
       (complete-multipart-upload
         (assoc upload :e-tags (map #(.get ^java.util.concurrent.Future %)  (.invokeAll pool tasks))))
-      (catch Exception ex 
-        (abort-multipart-upload upload) 
+      (catch Exception ex
+        (abort-multipart-upload upload)
         (.shutdown pool)
         (throw ex))
       (finally (.shutdown pool)))))
